@@ -56,12 +56,27 @@ function withCredentialFile(tool) {
 const TOOLS = buildTools();
 const BY_NAME = new Map(TOOLS.map((t) => [t.name, t]));
 
-/** Public tool metadata for tools/list and the manifest. */
-export function listTools() {
+// Over the network transport the credential arrives in the Authorization header,
+// so the per-tool credential_file argument is neither required nor accepted.
+// Derived once per tool; the stdio catalogue (and the manifest) are untouched.
+const HTTP_INPUT = new Map(
+  TOOLS.map((t) => {
+    const properties = { ...t.inputSchema.properties };
+    delete properties.credential_file;
+    const required = (t.inputSchema.required || []).filter((r) => r !== 'credential_file');
+    return [t.name, { ...t.inputSchema, properties, required }];
+  }),
+);
+
+/**
+ * Public tool metadata for tools/list and the manifest.
+ * @param {{ transport?: 'stdio'|'http' }} [opts] http = schemas without credential_file
+ */
+export function listTools({ transport = 'stdio' } = {}) {
   return TOOLS.map((t) => ({
     name: t.name,
     description: t.description,
-    inputSchema: t.inputSchema,
+    inputSchema: transport === 'http' ? HTTP_INPUT.get(t.name) : t.inputSchema,
     outputSchema: t.outputSchema,
     effect: t.effect,
     required_permissions: t.permissions,
@@ -102,7 +117,13 @@ function refusalRequest(config, tool, args) {
  *
  * @param {string} name
  * @param {Record<string, unknown>} rawArgs
- * @param {{ env?: Record<string,string|undefined>, signal?: AbortSignal }} [ctx]
+ * @param {{ env?: Record<string,string|undefined>, signal?: AbortSignal,
+ *   resolveCredential?: () => { role: string|null, token: string },
+ *   transport?: 'stdio'|'http' }} [ctx]
+ *   resolveCredential: alternative credential source (network header mode). It
+ *   runs at the same gate position as the credential file read (after the write
+ *   and confirmation gates and the server-config check). transport 'http'
+ *   validates against the schema without credential_file.
  */
 export async function executeTool(name, rawArgs, ctx = {}) {
   const tool = BY_NAME.get(name);
@@ -118,7 +139,7 @@ export async function executeTool(name, rawArgs, ctx = {}) {
     // 1. Validate inputs.
     let args;
     try {
-      args = validateArgs(tool.inputSchema, rawArgs);
+      args = validateArgs(ctx.transport === 'http' ? HTTP_INPUT.get(tool.name) : tool.inputSchema, rawArgs);
     } catch (err) {
       return refusalFrom(err, config, tool, rawArgs);
     }
@@ -160,10 +181,11 @@ export async function executeTool(name, rawArgs, ctx = {}) {
     // mutation, and verification.
     deadline = createDeadline(config.timeoutMs, ctx.signal);
 
-    // 5. Credential file (every tool except public health).
+    // 5. Credential (every tool except public health): the per-call file in stdio
+    // mode, or the request's Authorization header in network mode.
     if (!tool.publicRoute) {
       try {
-        cred = readCredentialFile(args.credential_file);
+        cred = ctx.resolveCredential ? ctx.resolveCredential() : readCredentialFile(args.credential_file);
       } catch (err) {
         return refusalFrom(err, config, tool, args);
       }

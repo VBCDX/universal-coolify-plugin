@@ -104,6 +104,46 @@ test('overlapping secrets registered longer-first also fully redact', () => {
   assert.equal(out, '<redacted>');
 });
 
+// Issue #15 (Refs #12): two secrets that overlap *partially* (neither contains
+// the other) and appear adjacent in the same text used to leave a fragment and
+// stay order-dependent, because sequential split/join consumes the shared run
+// with the first secret so the second no longer matches. These two share the
+// run 'SHARED99'; in the text below their match spans overlap. The fix resolves
+// spans against the original text and merges overlaps, so both orders collapse
+// to a single marker with no surviving fragment.
+const OVERLAP_LEFT = 'sk-FAKE-LEFT-SENTINEL-SHARED99';
+const OVERLAP_RIGHT = 'SHARED99-sk-FAKE-RIGHT-SENTINEL';
+const OVERLAP_TEXT = 'sk-FAKE-LEFT-SENTINEL-SHARED99-sk-FAKE-RIGHT-SENTINEL';
+
+test('partially-overlapping adjacent secrets fully redact (left registered first)', () => {
+  registerSecret(OVERLAP_LEFT);
+  registerSecret(OVERLAP_RIGHT);
+  const out = scrub(OVERLAP_TEXT);
+  assert.ok(!out.includes('FAKE-RIGHT-SENTINEL'), 'right fragment must not survive');
+  assert.ok(!out.includes('FAKE-LEFT-SENTINEL'), 'left fragment must not survive');
+  assert.equal(out, '<redacted>');
+});
+
+test('partially-overlapping adjacent secrets fully redact (right registered first)', () => {
+  registerSecret(OVERLAP_RIGHT);
+  registerSecret(OVERLAP_LEFT);
+  const out = scrub(OVERLAP_TEXT);
+  assert.ok(!out.includes('FAKE-RIGHT-SENTINEL'), 'right fragment must not survive');
+  assert.ok(!out.includes('FAKE-LEFT-SENTINEL'), 'left fragment must not survive');
+  assert.equal(out, '<redacted>');
+});
+
+// Guard the intended non-merge boundary: two DISTINCT secrets that are merely
+// adjacent (touching, not overlapping) with no shared run must still redact to
+// two separate markers, exactly as sequential split/join did — the fix must not
+// over-merge back-to-back secrets into one.
+test('back-to-back non-overlapping secrets redact to two separate markers', () => {
+  registerSecret('sk-FAKE-ADJ-ONE-0001');
+  registerSecret('sk-FAKE-ADJ-TWO-0002');
+  const out = scrub('sk-FAKE-ADJ-ONE-0001sk-FAKE-ADJ-TWO-0002');
+  assert.equal(out, '<redacted><redacted>');
+});
+
 // Finding 2 (Refs #12): a null-prototype object cannot be String()-coerced and
 // used to throw a TypeError, which stops the backstop from scrubbing at all.
 test('scrub does not throw on a null-prototype object', () => {
@@ -115,4 +155,96 @@ test('scrub does not throw on a null-prototype object', () => {
     out = scrub(weird);
   }, 'the backstop must never throw, whatever it is handed');
   assert.ok(!out.includes(secret), 'no secret survives an un-coercible value');
+});
+
+// Issue #14 (Refs #12): the coercion fallback must itself be throw-proof. The
+// PR #13 fallback called `Object.prototype.toString.call(text)`, which reads
+// `Symbol.toStringTag` — so a value whose tag lookup throws made the fallback
+// throw from inside the catch and scrub() propagated. The fix degrades to a
+// fixed constant. Each case below registers a secret, then asserts scrub()
+// neither throws nor lets the secret survive, for a range of hostile inputs.
+const FALLBACK_SECRET = 'sk-FAKE-SENTINEL-NEVER-REAL-0006';
+
+function assertBackstopHolds(value, label) {
+  registerSecret(FALLBACK_SECRET);
+  let out;
+  assert.doesNotThrow(() => {
+    out = scrub(value);
+  }, `the backstop must never throw for ${label}`);
+  assert.equal(typeof out, 'string', `scrub() must return a string for ${label}`);
+  assert.ok(
+    !out.includes(FALLBACK_SECRET),
+    `no registered secret may survive ${label}`,
+  );
+  clearSecrets();
+}
+
+test('scrub does not throw on a Proxy whose get trap throws', () => {
+  const proxy = new Proxy(
+    {},
+    {
+      get() {
+        throw new Error('trap-boom');
+      },
+    },
+  );
+  assertBackstopHolds(proxy, 'a Proxy with a throwing get trap');
+});
+
+test('scrub does not throw on an object with a throwing toStringTag getter', () => {
+  const obj = {};
+  Object.defineProperty(obj, Symbol.toStringTag, {
+    get() {
+      throw new Error('tag-boom');
+    },
+  });
+  assertBackstopHolds(obj, 'a throwing Symbol.toStringTag getter');
+});
+
+test('scrub does not throw on an object with a throwing toString', () => {
+  assertBackstopHolds(
+    {
+      toString() {
+        throw new Error('toString-boom');
+      },
+    },
+    'a throwing toString',
+  );
+});
+
+test('scrub does not throw on an object with a throwing valueOf', () => {
+  assertBackstopHolds(
+    {
+      valueOf() {
+        throw new Error('valueOf-boom');
+      },
+    },
+    'a throwing valueOf',
+  );
+});
+
+test('scrub does not throw on a Symbol', () => {
+  assertBackstopHolds(Symbol('desc'), 'a Symbol');
+});
+
+test('scrub does not throw on a BigInt', () => {
+  assertBackstopHolds(10n, 'a BigInt');
+});
+
+test('scrub does not throw on a circular object', () => {
+  const circular = {};
+  circular.self = circular;
+  assertBackstopHolds(circular, 'a circular object');
+});
+
+// Issue #20: on a coercion failure the fallback returns a fixed sentinel rather
+// than the empty string, so an operator still sees that a value was present but
+// unrenderable instead of silence. The sentinel is a literal constant, so it
+// keeps every leak-safety property (asserted throughout the tests above). A
+// null-prototype object has no reachable toString/valueOf, so String() throws
+// and this path is taken. Registering no secret isolates the fallback value:
+// with the old '' fallback this asserts empty, so it fails until the fix lands.
+test('scrub returns the <unrenderable> sentinel for an un-coercible input', () => {
+  const weird = Object.create(null);
+  assert.equal(scrub(weird), '<unrenderable>');
 });

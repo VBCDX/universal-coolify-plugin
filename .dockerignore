@@ -1,0 +1,10 @@
+.git
+.forgejo
+node_modules
+test
+examples
+*.md
+*.env
+!README.md
+Dockerfile
+.dockerignore

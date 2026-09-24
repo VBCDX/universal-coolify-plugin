@@ -65,25 +65,73 @@ export function scrub(text) {
   } else {
     // `String(text ?? '')` throws on a value that cannot be coerced to a
     // primitive — e.g. a null-prototype object, which has no reachable
-    // toString/valueOf. A backstop that throws stops scrubbing, so fall back to
-    // a form that never throws and cannot carry a secret verbatim.
+    // toString/valueOf. A backstop that throws stops scrubbing, so on any
+    // coercion failure degrade to a fixed sentinel. The sentinel is chosen
+    // over a second coercion attempt (e.g. `Object.prototype.toString.call`,
+    // which reads `Symbol.toStringTag` and so still throws for a Proxy with a
+    // throwing `get` trap or an object with a throwing `toStringTag` getter):
+    // a constant cannot throw and, being fixed text, cannot echo any part of
+    // the input — so no registered secret can leak through this path.
+    //
+    // The sentinel is `<unrenderable>` rather than an empty string so an
+    // operator reading a log or error message still sees that a value was
+    // present but could not be rendered, instead of silence. It is a literal
+    // constant, so it carries no input-derived text and keeps every
+    // leak-safety property of the empty-string fallback.
     try {
       out = String(text ?? '');
     } catch {
-      out = Object.prototype.toString.call(text);
+      out = '<unrenderable>';
     }
   }
   // Secrets are the Map keys; iterate keys(), not the Map itself (which yields
-  // [key, count] entry pairs and would never match the secret string). Iterate
-  // longest-first so that when one registered secret is a substring of another,
-  // the most specific match is consumed before a shorter one can split it and
-  // leave the longer secret's tail behind. This makes the result independent of
-  // registration order.
-  const secretsByLength = [...activeSecrets.keys()].sort(
-    (a, b) => b.length - a.length,
-  );
-  for (const secret of secretsByLength) {
-    if (secret) out = out.split(secret).join('<redacted>');
+  // [key, count] entry pairs and would never match the secret string).
+  //
+  // Resolve every match span for every registered secret against the ORIGINAL
+  // text, merge spans that overlap, then replace each merged span with a single
+  // marker in one left-to-right pass. This is done instead of a sequential
+  // split/join per secret because sequential replacement mutates the text
+  // between secrets: once `abcdef` becomes `<redacted>`, a later `split('cdefgh')`
+  // can no longer see the `cdef` the two secrets shared, so a partially
+  // overlapping neighbour leaves a fragment behind and the result depends on
+  // registration order. Matching spans against the untouched original and
+  // merging overlaps closes both the containment case and the partial-overlap
+  // case, order-independently.
+  if (activeSecrets.size > 0) {
+    /** @type {Array<[number, number]>} half-open [start, end) match spans */
+    const spans = [];
+    for (const secret of activeSecrets.keys()) {
+      if (!secret) continue;
+      // Non-overlapping matches of a single secret: advance past each hit so a
+      // repeated secret yields one span per occurrence.
+      let from = 0;
+      let idx;
+      while ((idx = out.indexOf(secret, from)) !== -1) {
+        spans.push([idx, idx + secret.length]);
+        from = idx + secret.length;
+      }
+    }
+    if (spans.length > 0) {
+      spans.sort((a, b) => a[0] - b[0] || a[1] - b[1]);
+      let result = '';
+      let cursor = 0; // end of the last span already emitted
+      let [start, end] = spans[0];
+      for (let i = 1; i <= spans.length; i++) {
+        // Merge only spans that truly overlap (the next starts before the
+        // current ends). Merely adjacent spans (next start === current end) are
+        // left separate so two back-to-back distinct secrets still redact to two
+        // markers, matching the prior behaviour.
+        if (i < spans.length && spans[i][0] < end) {
+          if (spans[i][1] > end) end = spans[i][1];
+          continue;
+        }
+        result += out.slice(cursor, start) + '<redacted>';
+        cursor = end;
+        if (i < spans.length) [start, end] = spans[i];
+      }
+      result += out.slice(cursor);
+      out = result;
+    }
   }
   // A defensive catch for an Authorization header that reached a string despite
   // us never intentionally formatting one.

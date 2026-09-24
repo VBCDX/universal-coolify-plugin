@@ -84,6 +84,48 @@ Substitute your git remote and the delivered commit, not a moving branch. An npm
 name/version launch command is advertised only after that version is published to
 a registry and tested.
 
+
+## Network mode (`serve`): MCP over Streamable HTTP
+
+`vbcdx-coolify serve` runs the same finite tool catalogue as an MCP server over the
+**Streamable HTTP** transport (stateless: a fresh server per request), for hosts that
+cannot run the stdio companion next to the agent — e.g. an MCP gateway (LiteLLM
+`true_passthrough`) or a harness container without Node.js.
+
+```sh
+VBCDX_COOLIFY_URL=https://coolify.example \
+VBCDX_COOLIFY_WRITES=off \
+npx vbcdx-coolify serve
+# → MCP endpoint:  POST http://0.0.0.0:8080/mcp
+# → liveness:      GET  http://0.0.0.0:8080/healthz
+```
+
+**Credentials per request, by header.** There is no credential file and no
+`credential_file` argument in this mode — the tool schemas drop it. The Coolify API
+token arrives in `Authorization: Bearer <token>` (or `token <token>`), is used for that
+one request, registered with the redactor and never cached or logged. Coolify has no
+password authentication, so there is no Basic scheme. Tool discovery works without a
+credential; a call without one returns a redacted `credential_missing` refusal before
+any Coolify request. The gate order (inputs → write gate → confirmation → server
+config → credential → HTTP), the write gate and the destructive confirmation are
+identical to stdio.
+
+A `POST /mcp` body larger than 1 MiB is refused with `413` before it is buffered
+(checked against `Content-Length` and, for chunked bodies, while reading); a body
+that is not JSON gets `400`. Both happen before any credential check or Coolify
+request.
+
+| Setting | Meaning |
+| --- | --- |
+| `VBCDX_COOLIFY_HTTP_PORT` | Listen port (default `8080`). |
+| `VBCDX_COOLIFY_HTTP_HOST` | Bind address (default `0.0.0.0`). `healthcheck` always probes `127.0.0.1`, so a specific non-loopback address makes the container report unhealthy; keep `0.0.0.0` (or a loopback address) in a container. |
+| `VBCDX_COOLIFY_TLS_CERT` / `VBCDX_COOLIFY_TLS_KEY` | Serve HTTPS directly (both or neither). |
+
+**Container.** `Dockerfile` builds `vbcdx-coolify serve` on a pinned Node 22 Alpine
+image as the unprivileged `node` user, with a `HEALTHCHECK` (`vbcdx-coolify
+healthcheck`, which probes `127.0.0.1:<port>/healthz`). No credential is baked into
+any layer. Plain HTTP is for trusted networks only; put TLS in front otherwise.
+
 ## Configuration (environment only)
 
 The server takes **no** secret, URL, role, or credential CLI options.
@@ -108,6 +150,7 @@ in the path. It contains `VBCDX_AGENTS_ROLE` (descriptive) and a nonblank
 `VBCDX_AGENTS_TOKEN`. The token is sent as `Authorization: Bearer <token>`;
 Coolify has no password fallback. See
 [`examples/credential-file.env.example`](examples/credential-file.env.example).
+Every environment variable the server reads is listed in [`.env.example`](.env.example).
 
 Token permissions (`read`, `read:sensitive`, `write`, `deploy`, `root`) are the
 token's, scoped to its team and role. A deploy-only token is legitimate. The
@@ -172,6 +215,15 @@ required permissions.
 npm ci
 npm test        # node --test; route-level fixtures, adversarial cases, no network
 ```
+
+## Continuous integration
+
+CI (`.forgejo/workflows/ci.yml`) runs on a self-hosted runner chosen by the
+`CI_RUNNER_LABEL` repository (or org) variable, so the runner's label is not
+baked into the published source. If you fork this repo and run its Forgejo
+workflows, set `CI_RUNNER_LABEL` to a label your runner advertises (for a
+GitHub-parity self-hosted runner, `self-hosted`). If it is left unset the jobs
+are silently skipped — an empty `runs-on` matches no runner.
 
 ## License
 
