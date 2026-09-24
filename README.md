@@ -126,6 +126,57 @@ image as the unprivileged `node` user, with a `HEALTHCHECK` (`vbcdx-coolify
 healthcheck`, which probes `127.0.0.1:<port>/healthz`). No credential is baked into
 any layer. Plain HTTP is for trusted networks only; put TLS in front otherwise.
 
+For the main consumer of this mode, see [Using with Hermes Agent](#using-with-hermes-agent).
+
+## Using with Hermes Agent
+
+[Hermes Agent](https://github.com/NousResearch/hermes-agent) (checked against
+v0.15.1, tag `v2026.5.29`) connects to MCP servers over stdio or Streamable HTTP.
+Use `serve` for Hermes, not the stdio companion.
+
+**Why `serve` and not stdio.** A Hermes agent keeps its config, `.env` and state in
+its own `HERMES_HOME`: one per profile, and `/opt/data` in the official container
+image. The stdio companion has to run next to the agent. It needs Node.js >= 22
+where the agent runs, plus a `0600` credential file on that same filesystem. A
+containerised Hermes, or one without Node.js, can't meet that from the host. With
+`serve`, Hermes only needs a URL and a header.
+
+**Request path.**
+
+```text
+Hermes profile ──► LiteLLM (auth_type: true_passthrough) ──► vbcdx-coolify serve ──► Coolify API
+```
+
+Each Hermes profile holds its own Coolify API token and sends it as
+`Authorization: Bearer <token>` on every request. LiteLLM `true_passthrough`
+forwards the client's `Authorization` header verbatim and stores nothing. `serve`
+uses the token for that one request only. It never caches or logs it (see above).
+The token's Coolify permissions, and `VBCDX_COOLIFY_WRITES` on the `serve` host,
+bound what each agent can do. You can also point Hermes straight at `serve` and
+skip LiteLLM; the Hermes config below is the same apart from the URL.
+
+**Hermes config.** Add to `mcp_servers` in the profile's
+`$HERMES_HOME/config.yaml` (`~/.hermes/config.yaml` by default). A `url` entry
+uses Streamable HTTP. Hermes resolves `${VAR}` in the entry from the
+environment, including the profile's `$HERMES_HOME/.env`, so the token stays out
+of `config.yaml`:
+
+```yaml
+mcp_servers:
+  coolify:
+    url: "https://litellm.example/coolify/mcp"   # or https://coolify-mcp.example/mcp for serve directly
+    headers:
+      Authorization: "Bearer ${COOLIFY_API_TOKEN}"
+```
+
+```sh
+# $HERMES_HOME/.env — one token per profile (agent)
+COOLIFY_API_TOKEN=<this-agent's-coolify-api-token>
+```
+
+The LiteLLM server entry for `serve` needs `auth_type: true_passthrough`. The path
+segment (`coolify` above) is that entry's name in LiteLLM's `mcp_servers`.
+
 ## Configuration (environment only)
 
 The server takes **no** secret, URL, role, or credential CLI options.
